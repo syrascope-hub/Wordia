@@ -1,0 +1,102 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate project folder (pubspec.yaml)
+        run: |
+          f=$(find . -name pubspec.yaml -not -path '*/.*' -not -path '*/node_modules/*' | head -n 1)
+          if [ -z "$f" ]; then echo "pubspec.yaml not found"; exit 1; fi
+          d=$(dirname "$f")
+          echo "Project dir: $d"
+          echo "PROJECT_DIR=$d" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Android project files
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          mkdir -p /tmp/keep
+          cp -r lib /tmp/keep/lib
+          cp pubspec.yaml /tmp/keep/pubspec.yaml
+          flutter create --platforms=android --org com.astro --project-name lexi_words .
+          rm -rf lib test
+          cp -r /tmp/keep/lib lib
+          cp /tmp/keep/pubspec.yaml pubspec.yaml
+
+      - name: Patch Android (permissions, desugaring, minSdk)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: python3 tool/patch_android.py
+
+      - name: Download fonts (Tajawal, Lalezar, Lilita One)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: python3 tool/fetch_fonts.py
+
+      - name: Install dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter pub get
+
+      - name: Generate launcher icons (Wordia)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: dart run flutter_launcher_icons
+
+      - name: Analyze (does not block the build)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+        continue-on-error: true
+
+      # توقيع ثابت: بدونه يُنشئ كل تشغيل مفتاح debug جديداً (المشغّل مؤقت)، فترفض
+      # أندرويد تثبيت النسخة الجديدة فوق القديمة ويضطر المستخدم للحذف (وتضيع بياناته المحلية).
+      - name: Restore persistent signing key
+        env:
+          DEBUG_KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$DEBUG_KEYSTORE_B64" ]; then
+            mkdir -p ~/.android
+            echo "$DEBUG_KEYSTORE_B64" | base64 -d > ~/.android/debug.keystore
+            echo "Using persistent keystore"
+          else
+            echo "::warning::DEBUG_KEYSTORE_B64 غير موجود: كل بناء سيحمل توقيعاً جديداً ولن يُثبَّت فوق القديم (انظر README)."
+          fi
+
+      - name: Build release APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: flutter build apk --release --dart-define=HF_TOKEN="$HF_TOKEN"
+
+      - name: Rename APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: cp build/app/outputs/flutter-apk/app-release.apk wordia.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wordia-apk
+          path: ${{ env.PROJECT_DIR }}/wordia.apk
+
+      - name: Publish release (direct download link)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Wordia 2.2 build ${{ github.run_number }}
+          files: ${{ env.PROJECT_DIR }}/wordia.apk
